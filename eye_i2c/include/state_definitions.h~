@@ -1,0 +1,10 @@
+#define MASTER_IDLE            1
+#define MASTER_RUNNING         2
+#define MASTER_RECORD          3
+#define MASTER_RECORDING       4
+#define MASTER_PLAYBACK        5
+#define MASTER_REPORT_SLIDE    6
+#define MASTER_REPORT_JOYSTICK 7
+#define MASTER_ONE_POLL        8
+#define MASTER_STOP            9
+

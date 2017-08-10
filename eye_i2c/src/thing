@@ -1,0 +1,274 @@
+// this code designed to work on PCBs with onboard L6234 drivers
+
+#include "definitions.h"
+#include "variables.h"
+#include "motor_funcs.h"
+#include <i2c_t3.h>
+
+
+void setup() {
+  inputString.reserve(200);
+
+  Serial.begin(SERIAL_SPEED);
+  JOY.begin(SERIAL_SPEED);
+  // Wire.begin(I2C_MASTER, 0x00, I2C_PINS_18_19, I2C_PULLUP_EXT, I2C_RATE_1200);
+  pinMode(LEDPin, OUTPUT);
+
+  initMotors();
+}
+
+void loop() {
+  checkUSBSerial();
+  checkJoySerial();
+  
+  switch (state) {
+  case E_STATE_RQST:
+    if (joyState2 == E_STATE_PAUSE) {
+      setSlaveState(J_SELECT_MODE2);
+    }
+    else if (joyState2 == E_IDLE ||
+	joyState2 == E_STOP_MOVE ||
+	joyState2 == E_RUNNING ||
+	joyState2 == E_START_RECORD ||
+	joyState2 == E_STOP_RECORD ||
+	joyState2 == E_START_PLAYBACK) {
+      state = joyState2;
+      Serial.printf("approved state change %d\n", joyState2);
+    }
+    else {
+      state = E_IDLE;
+      Serial.printf("unapproved state change %d\n", joyState2);
+    }
+    break;
+
+  case E_START_RECORD:
+    setSlaveState(J_RECORDING);
+    recordCount = 0;
+    elapsedRecordTime = 0;
+    recordTime = recordInterval;
+    state = E_RECORD;
+    break;
+
+  case E_RECORD:
+    if (recordCount > MAX_RECORD_LENGTH - 1) {
+      state = E_STOP_RECORD;
+      break;
+    }
+
+    if (elapsedRecordTime > recordTime) {
+      uint8_t motor = 0;
+      slideStore.slideData.slideVal1 = slideVals[0];
+      slideStore.slideData.slideVal2 = slideVals[1];
+      slideStore.slideData.slideVal3 = slideVals[2];
+      slideStore.slideData.slideVal4 = slideVals[3];
+      for(uint8_t i = 0; i < SLIDE_PACKET_SIZE; i++) {
+	slideArray[recordCount][i] = slideStore.slidePacket[i];
+      }
+
+      recordCount++;
+      recordTime += recordInterval;
+    }
+    updateMotors(-1);
+    break;
+
+  case E_STOP_RECORD:
+    JOY.write("K\n"); // be quiet
+    delay(400);
+    state = E_RUNNING;
+    break;
+
+  case E_START_PLAYBACK:
+    setSlaveState(J_PLAYING);
+    Serial.printf("playback %d\n", recordCount);
+    playbackCount = 0;
+    elapsedRecordTime = 0;
+    pbTime = pbInterval;
+    state = E_PLAYBACK;
+    break;
+
+  case E_PLAYBACK:
+    if (playbackCount > recordCount || playbackCount > MAX_RECORD_LENGTH) {
+      state = E_STOP_PLAYBACK;
+      break;
+    }
+
+    if (elapsedRecordTime > pbTime) { // must be done, move on.
+      for(uint8_t i = 0; i < SLIDE_PACKET_SIZE; i++) {
+	slideStore.slidePacket[i] = slideArray[playbackCount][i];
+      }
+      slideVals[0] = slideStore.slideData.slideVal1;
+      slideVals[1] = slideStore.slideData.slideVal2;
+      slideVals[2] = slideStore.slideData.slideVal3;
+      slideVals[3] = slideStore.slideData.slideVal4;
+
+      pbTime += pbInterval;
+      playbackCount++;
+    }
+
+    updateMotor(0, slideStore.slideData.slideVal1);
+    updateMotor(1, slideStore.slideData.slideVal2);
+    updateMotor(2, slideStore.slideData.slideVal3);
+    updateMotor(3, slideStore.slideData.slideVal4);
+    break;
+
+  case E_STOP_PLAYBACK:
+    // tell slave to go to new state
+    Serial.println("stop PB");
+    // setSlaveState(J_IDLE_MODE);
+    recordCount = 0;
+    state = E_RUNNING;
+    break;
+
+  case E_STOP_MOVE: // motor pause
+    setMotorState(0, false); setMotorState(1, false);
+    setMotorState(2, false); setMotorState(3, false);
+    break;
+
+  case E_RUNNING:
+    if (recordCount != 0) { // transitioning from recording
+    }
+    updateMotors(-1); 
+    break;
+
+  case E_IDLE:
+    for (uint8_t motor = 0; motor < 4; motor++) {
+      setMotorState(motor, false);
+    }
+    break;
+
+  case E_REPORT_SLIDE:
+    Serial.printf("slide %d %d %d %d\n",
+		  analogRead(slidePins[0]),
+		  analogRead(slidePins[1]),
+		  analogRead(slidePins[2]),
+		  analogRead(slidePins[3]));
+    delay(300);
+    state = E_REPORT_SLIDE;
+    break;
+
+  case E_REPORT_JOYSTICK:
+    Serial.printf("states %d %d\n", joyState1, joyState2);
+    Serial.printf("joy %d %d %d %d\n", joyVals[0], joyVals[1], joyVals[2], joyVals[3]);
+    delay(800);
+    break;
+
+  default:
+    Serial.printf("Unknown state %d\n", state);
+    break;
+  }
+
+  // you need system to stop polling
+  // joyToggle = true / false
+  pingJoySerial();
+}
+
+void setSlaveState(uint8_t x) {
+  delay(800);
+  JOY.printf("state %d\n", x);
+  delay(100);
+}
+
+void setSlaveIcon(uint8_t x) {
+  delay(800);
+  JOY.printf("icon %d\n", x);
+  delay(100);
+}
+
+void pingJoySerial() {
+  JOY.write("P\n"); // poll the joystick
+  gotJoyData = false;
+}
+
+void checkUSBSerial() { 
+  while (Serial.available()) {
+    char inChar = (char)Serial.read();
+    inputString += inChar;
+    if (inChar == '\n') {
+      handle_cmd();
+    }
+  }
+}
+
+void handle_cmd() {
+  inputString.trim(); // removes beginning and ending white spaces
+  int idx = inputString.indexOf(' ');   
+  String cmd = inputString.substring(0, idx); 
+  String value = inputString.substring(idx + 1);
+
+  if ((cmd.length() > 0)) {
+    if (cmd.equals("probe_device")) {
+      Serial.println("eye driver");
+    }
+    if (cmd.equals("run")) {
+      Serial.println("running");
+      state = E_RUNNING;
+    }
+    if (cmd.equals("report_state")) {
+      Serial.println(state);
+    }
+    if (cmd.equals("purge")) {
+      Serial.println("purging");
+      purge();
+    }
+    if (cmd.equals("report_slide")) {
+      Serial.println(cmd);
+      state = E_REPORT_SLIDE;
+    }
+    if (cmd.equals("report_joystick")) {
+      Serial.println(cmd);
+      state = E_REPORT_JOYSTICK;
+    }
+    if (cmd.equals("idle")) {
+      Serial.println(cmd);
+      state = E_IDLE;
+    }
+    inputString = "";
+  }
+}
+
+void checkJoySerial() { 
+  while (JOY.available()) {
+    uint8_t inByte = JOY.read();
+    if (inByte == '$') { joyCount = 0; joyBuf[JOY_LEN - 1] = 'Q';}
+    if (joyCount < JOY_LEN) { joyBuf[joyCount] = inByte; }
+    if(joyBuf[0] == '$' && joyBuf[JOY_LEN - 1] == '\n') {
+
+      // order from joyBuf
+      // 1, 2 two bytes are now linked to button1 and button2 on joystick. 
+      // 3, 4 :: 5, 6      LEFT JS U/D :: L/R
+      // 7, 8 :: 9, 10    RIGHT JS U/D :: L/R
+
+      joyState1 = joyBuf[1]; joyState2 = joyBuf[2];
+
+      if (joyState1 == 'R') {
+	state = E_STATE_RQST;
+      }
+
+      // motor0 :: eye L / R
+      joyVals[0] = word(joyBuf[9], joyBuf[10]); 
+      joyVals[0] = map(joyVals[0], 1, 1024, slideMax[0], slideMin[0]);
+      joyVals[0] = constrain(joyVals[0], slideMin[0], slideMax[0]);
+
+      // motor1 :: lower lid
+      joyVals[1] = word(joyBuf[3], joyBuf[4]); 
+      joyVals[1] = map(joyVals[1], 1, 1024, slideMin[1], slideMax[1]); // no reversing
+      joyVals[1] = constrain(joyVals[1], slideMin[1], slideMax[1]);
+
+      // motor2 :: eye U / D
+      joyVals[2] = word(joyBuf[7], joyBuf[8]); 
+      joyVals[2] = map(joyVals[2], 1, 1024, slideMax[0], slideMin[2]);
+      joyVals[2] = constrain(joyVals[2], slideMin[2], slideMax[2]);
+
+      // motor3 :: top lid
+      joyVals[3] = word(joyBuf[5], joyBuf[6]); 
+      joyVals[3] = map(joyVals[3], 1, 900, slideMax[0], slideMin[3]);
+      joyVals[3] = constrain(joyVals[3], slideMin[3], slideMax[3]);
+
+      joyCount = 0;
+      gotJoyData = true;
+
+    }
+    joyCount++;
+  }
+}
+
